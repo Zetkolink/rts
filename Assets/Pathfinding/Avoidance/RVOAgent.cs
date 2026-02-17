@@ -107,10 +107,8 @@ namespace RTS.Pathfinding.Avoidance
 
             var sim = RVO.Simulator.Instance;
 
-            // 1. Sync position: Unity → RVO
             sim.setAgentPosition(_rvoId, ToRVO(transform.position));
 
-            // 2. Set preferred velocity from pathfinding
             RVO.Vector2 prefVel = new RVO.Vector2(0f, 0f);
 
             if (_follower.HasPath)
@@ -125,7 +123,6 @@ namespace RTS.Pathfinding.Avoidance
                     Vector3 dir = toWaypoint / distance;
                     float speed = _maxSpeed * _follower.SpeedMultiplier;
 
-                    // Slow down near waypoint to prevent oscillation
                     if (distance < _arrivalSlowdownRadius)
                         speed *= distance / _arrivalSlowdownRadius;
 

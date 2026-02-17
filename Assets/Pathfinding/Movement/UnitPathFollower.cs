@@ -26,8 +26,11 @@ namespace RTS.Pathfinding
         // Stuck detection
         private int _stuckFrames;
         private float _lastDistanceToWaypoint = float.MaxValue;
+        private float _lastDistanceToFinal = float.MaxValue;
         private RTS.Pathfinding.Avoidance.RVOAgent _rvoAgent;
         private bool _hasRVO;
+        private int _arrivalStuckFrames;
+        private const int ArrivalStuckThreshold = 40;
 
 
         // ───────────── Public Read-Only State ─────────────
@@ -123,6 +126,8 @@ namespace RTS.Pathfinding
             CurrentSpeed = 0f;
             _stuckFrames = 0;
             _lastDistanceToWaypoint = float.MaxValue;
+            _arrivalStuckFrames = 0;
+            _lastDistanceToFinal = float.MaxValue;
         }
 
         // ───────────── Internals ─────────────
@@ -230,20 +235,53 @@ namespace RTS.Pathfinding
             _lastDistanceToWaypoint = distance;
 
             // ── Waypoint reached ──
-            if (distance <= _waypointReachedThreshold)
-            {
-                _currentWaypointIndex++;
+            bool isFinalWaypoint = _currentWaypointIndex >= _waypoints.Length - 1;
 
-                if (_currentWaypointIndex >= _waypoints.Length)
+            if (isFinalWaypoint)
+            {
+                float distToFinal = distance;
+                bool closeEnough = distToFinal <= _waypointReachedThreshold * 3f;
+
+                // RVO pushing away from target — other units blocking
+                bool rvoPushingAway = false;
+                if (_hasRVO && _rvoAgent.ComputedVelocity.sqrMagnitude > 0.01f)
+                {
+                    Vector3 rvoDir = _rvoAgent.ComputedVelocity.normalized;
+                    float dot = Vector3.Dot(rvoDir, toTarget.normalized);
+                    rvoPushingAway = dot < 0.2f && distToFinal < _baseSpeed * 1.5f;
+                }
+
+                // Not making progress toward destination — area is full
+                if (distToFinal >= _lastDistanceToFinal - 0.01f)
+                {
+                    _arrivalStuckFrames++;
+                }
+                else
+                {
+                    _arrivalStuckFrames = 0;
+                }
+                _lastDistanceToFinal = distToFinal;
+
+                bool cantGetCloser = _arrivalStuckFrames >= ArrivalStuckThreshold;
+
+                if (closeEnough || rvoPushingAway || cantGetCloser)
                 {
                     _hasPath = false;
                     CurrentSpeed = 0f;
                     _waypoints = null;
+                    _arrivalStuckFrames = 0;
+                    _lastDistanceToFinal = float.MaxValue;
                     return;
                 }
-
-                _lastDistanceToWaypoint = float.MaxValue;
-                return;
+            }
+            else
+            {
+                if (distance <= _waypointReachedThreshold)
+                {
+                    _currentWaypointIndex++;
+                    _lastDistanceToWaypoint = float.MaxValue;
+                    return;
+                }
             }
 
             // ── Rotate ──

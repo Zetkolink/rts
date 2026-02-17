@@ -1,4 +1,5 @@
-﻿using UnityEngine;
+﻿using System.Collections.Generic;
+using UnityEngine;
 using UnityEngine.InputSystem;
 using RTS.Pathfinding.Debugging;
 
@@ -9,34 +10,86 @@ namespace RTS.Pathfinding
         [Header("Debug Overlay")]
         [SerializeField] private PathfindingDebugOverlay _debugOverlay;
 
-        [Header("Click to move all units")]
+        [Header("Click to move units")]
         [SerializeField] private LayerMask _groundMask;
 
-        private UnitPathFollower[] _units;
+        private UnitPathFollower[] _groupLeftClick;
+        private UnitPathFollower[] _groupRightClick;
 
         private void Start()
         {
-            _units = FindObjectsByType<UnitPathFollower>(FindObjectsSortMode.None);
-            Debug.Log($"[Test] Found {_units.Length} units");
+            var all = FindObjectsByType<UnitPathFollower>(FindObjectsSortMode.None);
+            Debug.Log($"[Test] Found {all.Length} units");
+
+            var left = new List<UnitPathFollower>(all.Length / 2 + 1);
+            var right = new List<UnitPathFollower>(all.Length / 2 + 1);
+
+            for (int i = 0; i < all.Length; i++)
+            {
+                var u = all[i];
+                if (u == null) continue;
+
+                if ((i & 1) == 0) left.Add(u);
+                else right.Add(u);
+            }
+
+            _groupLeftClick = left.ToArray();
+            _groupRightClick = right.ToArray();
+
+            Debug.Log($"[Test] Groups: LMB={_groupLeftClick.Length}, RMB={_groupRightClick.Length}");
         }
 
         private void Update()
         {
-            if (Mouse.current == null) return;
+            var mouse = Mouse.current;
+            if (mouse == null) return;
 
-            if (Mouse.current.leftButton.wasPressedThisFrame)
+            // ЛКМ -> группа 1
+            if (mouse.leftButton.wasPressedThisFrame)
             {
-                Ray ray = Camera.main.ScreenPointToRay(Mouse.current.position.ReadValue());
-                if (Physics.Raycast(ray, out RaycastHit hit, 500f, _groundMask))
+                if (TryGetGroundPoint(out var point))
                 {
-                    for (int i = 0; i < _units.Length; i++)
-                    {
-                        if (_units[i] != null)
-                            _units[i].MoveTo(hit.point);
-                    }
-
-                    Debug.Log($"[Test] {_units.Length} units moving to {hit.point}");
+                    MoveGroup(_groupLeftClick, point);
+                    Debug.Log($"[Test] LMB group({_groupLeftClick.Length}) moving to {point}");
                 }
+            }
+
+            // ПКМ -> группа 2
+            if (mouse.rightButton.wasPressedThisFrame)
+            {
+                if (TryGetGroundPoint(out var point))
+                {
+                    MoveGroup(_groupRightClick, point);
+                    Debug.Log($"[Test] RMB group({_groupRightClick.Length}) moving to {point}");
+                }
+            }
+        }
+
+        private bool TryGetGroundPoint(out Vector3 point)
+        {
+            point = default;
+
+            var cam = Camera.main;
+            if (cam == null) return false;
+
+            var mouse = Mouse.current;
+            if (mouse == null) return false;
+
+            var ray = cam.ScreenPointToRay(mouse.position.ReadValue());
+            if (!Physics.Raycast(ray, out var hit, 500f, _groundMask)) return false;
+
+            point = hit.point;
+            return true;
+        }
+
+        private static void MoveGroup(UnitPathFollower[] group, Vector3 destination)
+        {
+            if (group == null) return;
+
+            for (int i = 0; i < group.Length; i++)
+            {
+                var u = group[i];
+                if (u != null) u.MoveTo(destination);
             }
         }
     }
