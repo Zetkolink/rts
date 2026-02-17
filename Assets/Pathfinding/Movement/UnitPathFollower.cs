@@ -337,6 +337,12 @@ namespace RTS.Pathfinding
             if (moveDir.sqrMagnitude > 0.01f)
                 _lastMoveDirection = moveDir;
 
+// ── Track actual speed ──
+            if (_hasRVO)
+                CurrentSpeed = _rvoAgent.ComputedVelocity.magnitude;
+            else
+                CurrentSpeed = BaseSpeed * SpeedMultiplier;
+
 // Only rotate when actually moving
             if (_lastMoveDirection.sqrMagnitude > 0.01f && CurrentSpeed > 0.1f)
             {
