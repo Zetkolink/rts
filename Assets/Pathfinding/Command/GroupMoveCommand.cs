@@ -98,8 +98,9 @@ namespace RTS.Pathfinding
                 }
             }
 
-            // Assign destinations: sort units by distance to their slot for optimal assignment
-            int[] assignment = AssignUnitsToSlots(units, destinations);
+            // Assign units to slots: front units → front slots, left → left
+            Vector3 movDir = toTarget.sqrMagnitude > 0.01f ? toTarget.normalized : Vector3.forward;
+            int[] assignment = AssignUnitsToFormationSlots(units, offsets, movDir);
 
             // Issue individual move commands
             for (int i = 0; i < units.Count; i++)
@@ -120,49 +121,97 @@ namespace RTS.Pathfinding
         }
 
         /// <summary>
-        /// Simple greedy assignment: each unit goes to the nearest unoccupied slot.
-        /// Prevents units from crossing paths unnecessarily.
+        /// Assign units to formation slots using row-column projection matching.
+        /// Front units (closest to destination along movement axis) receive front
+        /// formation slots; within each row, leftmost units receive leftmost slots.
+        /// Eliminates path crossing on both forward and lateral axes.
+        /// O(N log N) complexity.
         /// </summary>
-        private static int[] AssignUnitsToSlots(
+        private static int[] AssignUnitsToFormationSlots(
             IList<UnitPathFollower> units,
-            Vector3[] destinations)
+            Vector3[] offsets,
+            Vector3 movementDir)
         {
             int count = units.Count;
             var assignment = new int[count];
-            var slotTaken = new bool[count];
 
-            // Build distance pairs and sort by distance
-            var pairs = new List<(int unitIdx, int slotIdx, float distSq)>(count * count);
-            for (int u = 0; u < count; u++)
+            // Compute lateral axis (perpendicular to movement in XZ plane)
+            Vector3 perpDir = Vector3.Cross(Vector3.up, movementDir);
+            if (perpDir.sqrMagnitude < 0.001f)
             {
-                if (units[u] == null) continue;
-                Vector3 unitPos = units[u].transform.position;
-                for (int s = 0; s < count; s++)
+                movementDir = Vector3.forward;
+                perpDir = Vector3.right;
+            }
+
+            // ── Group formation slots into rows by local Z ──
+            // Sort slot indices by Z descending (front first)
+            var slotOrder = new int[count];
+            for (int i = 0; i < count; i++) slotOrder[i] = i;
+            System.Array.Sort(slotOrder, (a, b) => offsets[b].z.CompareTo(offsets[a].z));
+
+            // Walk sorted slots and split into rows at Z discontinuities
+            var rows = new List<List<int>>(8);
+            var currentRow = new List<int>(8) { slotOrder[0] };
+
+            for (int i = 1; i < count; i++)
+            {
+                float zPrev = offsets[slotOrder[i - 1]].z;
+                float zCurr = offsets[slotOrder[i]].z;
+
+                if (zPrev - zCurr > 0.01f)
                 {
-                    float distSq = (unitPos - destinations[s]).sqrMagnitude;
-                    pairs.Add((u, s, distSq));
+                    rows.Add(currentRow);
+                    currentRow = new List<int>(8);
+                }
+                currentRow.Add(slotOrder[i]);
+            }
+            rows.Add(currentRow);
+
+            // ── Rank units by forward projection (frontmost first) ──
+            var unitIndices = new int[count];
+            var forwardProj = new float[count];
+            var lateralProj = new float[count];
+
+            for (int i = 0; i < count; i++)
+            {
+                unitIndices[i] = i;
+                if (units[i] != null)
+                {
+                    Vector3 pos = units[i].transform.position;
+                    forwardProj[i] = Vector3.Dot(pos, movementDir);
+                    lateralProj[i] = Vector3.Dot(pos, perpDir);
+                }
+                else
+                {
+                    forwardProj[i] = float.MinValue;
+                    lateralProj[i] = 0f;
                 }
             }
 
-            pairs.Sort((a, b) => a.distSq.CompareTo(b.distSq));
+            System.Array.Sort(unitIndices, (a, b) => forwardProj[b].CompareTo(forwardProj[a]));
 
-            var unitAssigned = new bool[count];
-
-            for (int p = 0; p < pairs.Count; p++)
+            // ── Assign row by row ──
+            int cursor = 0;
+            for (int r = 0; r < rows.Count; r++)
             {
-                var (u, s, _) = pairs[p];
-                if (unitAssigned[u] || slotTaken[s]) continue;
+                var row = rows[r];
+                int rowSize = row.Count;
 
-                assignment[u] = s;
-                unitAssigned[u] = true;
-                slotTaken[s] = true;
-            }
+                // Sort slots in this row by local X ascending (leftmost first)
+                row.Sort((a, b) => offsets[a].x.CompareTo(offsets[b].x));
 
-            // Fallback: any unassigned units get their own index
-            for (int i = 0; i < count; i++)
-            {
-                if (!unitAssigned[i])
-                    assignment[i] = i;
+                // Extract batch of unit indices for this row, sort by lateral projection
+                var batch = new int[rowSize];
+                for (int j = 0; j < rowSize; j++)
+                    batch[j] = unitIndices[cursor + j];
+
+                System.Array.Sort(batch, (a, b) => lateralProj[a].CompareTo(lateralProj[b]));
+
+                // Zip: leftmost unit → leftmost slot
+                for (int j = 0; j < rowSize; j++)
+                    assignment[batch[j]] = row[j];
+
+                cursor += rowSize;
             }
 
             return assignment;
