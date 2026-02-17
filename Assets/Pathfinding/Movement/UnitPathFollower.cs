@@ -13,6 +13,7 @@ namespace RTS.Pathfinding
         [Header("Movement")] [SerializeField] private float _baseSpeed = 5f;
         [SerializeField] private float _waypointReachedThreshold = 0.15f;
         [SerializeField] private float _rotationSpeed = 720f;
+        [SerializeField] private float _formationRadius = 1.0f; // Radius for formation around destination
 
         [Header("Repath")] [SerializeField] private int _stuckFrameThreshold = 30;
 
@@ -28,6 +29,10 @@ namespace RTS.Pathfinding
         private float _lastDistanceToWaypoint = float.MaxValue;
         private RTS.Pathfinding.Avoidance.RVOAgent _rvoAgent;
         private bool _hasRVO;
+        
+        // Formation management
+        private static System.Collections.Generic.List<UnitPathFollower> _unitsAtDestination = 
+            new System.Collections.Generic.List<UnitPathFollower>();
 
 
         // ───────────── Public Read-Only State ─────────────
@@ -236,9 +241,8 @@ namespace RTS.Pathfinding
 
                 if (_currentWaypointIndex >= _waypoints.Length)
                 {
-                    _hasPath = false;
-                    CurrentSpeed = 0f;
-                    _waypoints = null;
+                    // Reached destination - join formation
+                    JoinFormation();
                     return;
                 }
 
@@ -300,6 +304,67 @@ namespace RTS.Pathfinding
             Gizmos.color = Color.red;
             Gizmos.DrawSphere(_finalDestination + Vector3.up * 0.3f, 0.25f);
         }
-#endif
+        
+        // ───────────── Formation Management ─────────────
+        
+        private void JoinFormation()
+        {
+            // Add this unit to the list of units at destination
+            _unitsAtDestination.Add(this);
+            
+            // Calculate this unit's position in formation
+            int unitIndex = _unitsAtDestination.IndexOf(this);
+            float anglePerUnit = 2 * Mathf.PI / _unitsAtDestination.Count;
+            float angle = unitIndex * anglePerUnit;
+            
+            // Calculate formation position around the destination
+            Vector3 formationOffset = new Vector3(
+                Mathf.Cos(angle) * _formationRadius,
+                0,
+                Mathf.Sin(angle) * _formationRadius
+            );
+            
+            Vector3 formationPosition = _finalDestination + formationOffset;
+            
+            // Stop the current path follower
+            _hasPath = false;
+            CurrentSpeed = 0f;
+            _waypoints = null;
+            
+            // Move to formation position using RVO agent if available
+            if (_hasRVO)
+            {
+                // Update the RVO agent's destination to the formation position
+                _rvoAgent.GetComponent<UnitPathFollower>().MoveTo(formationPosition);
+            }
+            else
+            {
+                // If no RVO agent, just move to the position directly
+                transform.position = formationPosition;
+            }
+        }
+        
+        // Method to clear this unit from the formation list when it leaves
+        private void LeaveFormation()
+        {
+            if (_unitsAtDestination.Contains(this))
+            {
+                _unitsAtDestination.Remove(this);
+                
+                // Reorganize formation for remaining units
+                foreach (var unit in _unitsAtDestination)
+                {
+                    if (unit != null)
+                    {
+                        unit.JoinFormation();
+                    }
+                }
+            }
+        }
+        
+        private void OnDestroy()
+        {
+            LeaveFormation();
+        }
     }
 }
