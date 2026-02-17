@@ -1,0 +1,237 @@
+    using UnityEngine;
+
+namespace RTS.Pathfinding
+{
+    /// <summary>
+    /// Owns the walkability grid. Converts between world and grid coordinates.
+    /// Performs initial bake and runtime partial updates.
+    /// Pure C# with no MonoBehaviour dependency — instantiated by PathfindingAPI.
+    /// </summary>
+    public sealed class GridManager
+    {
+        // Flat array: index = z * width + x. true = walkable.
+        private readonly bool[] _walkable;
+        private readonly GridSettings _settings;
+
+        public int Width => _settings.width;
+        public int Height => _settings.height;
+        public float CellSize => _settings.cellSize;
+        public Vector3 WorldOrigin => _settings.worldOrigin;
+
+        public GridManager(GridSettings settings)
+        {
+            _settings = settings;
+            _walkable = new bool[settings.width * settings.height];
+        }
+
+        // ───────────── Coordinate Conversion ─────────────
+
+        public Vector2Int WorldToGrid(Vector3 worldPos)
+        {
+            float localX = worldPos.x - _settings.worldOrigin.x;
+            float localZ = worldPos.z - _settings.worldOrigin.z;
+            int gx = Mathf.FloorToInt(localX / _settings.cellSize);
+            int gz = Mathf.FloorToInt(localZ / _settings.cellSize);
+            return new Vector2Int(
+                Mathf.Clamp(gx, 0, _settings.width - 1),
+                Mathf.Clamp(gz, 0, _settings.height - 1)
+            );
+        }
+
+        public Vector3 GridToWorld(int x, int z)
+        {
+            float wx = _settings.worldOrigin.x + (x + 0.5f) * _settings.cellSize;
+            float wz = _settings.worldOrigin.z + (z + 0.5f) * _settings.cellSize;
+            return new Vector3(wx, _settings.worldOrigin.y, wz);
+        }
+
+        public Vector3 GridToWorld(Vector2Int cell) => GridToWorld(cell.x, cell.y);
+
+        // ───────────── Grid Access ─────────────
+
+        public bool InBounds(int x, int z) =>
+            x >= 0 && x < _settings.width && z >= 0 && z < _settings.height;
+
+        public bool InBounds(Vector2Int cell) => InBounds(cell.x, cell.y);
+
+        public bool IsWalkable(int x, int z)
+        {
+            if (!InBounds(x, z)) return false;
+            return _walkable[z * _settings.width + x];
+        }
+
+        public bool IsWalkable(Vector2Int cell) => IsWalkable(cell.x, cell.y);
+
+        public void SetWalkable(int x, int z, bool walkable)
+        {
+            if (!InBounds(x, z)) return;
+            _walkable[z * _settings.width + x] = walkable;
+        }
+
+        // ───────────── Bake ─────────────
+
+        /// <summary>
+        /// Full grid scan using Physics.CheckBox.
+        /// Call once at scene load for static obstacles.
+        /// </summary>
+        public void BakeStaticObstacles()
+        {
+            Vector3 halfExtents = BuildHalfExtents();
+            LayerMask mask = _settings.staticObstacleMask;
+
+            for (int z = 0; z < _settings.height; z++)
+            {
+                for (int x = 0; x < _settings.width; x++)
+                {
+                    Vector3 center = GridToWorld(x, z);
+                    center.y += _settings.obstacleCheckHeight * 0.5f;
+
+                    bool blocked = Physics.CheckBox(
+                        center, halfExtents,
+                        Quaternion.identity, mask,
+                        QueryTriggerInteraction.Ignore
+                    );
+
+                    _walkable[z * _settings.width + x] = !blocked;
+                }
+            }
+
+            ApplyErosion();
+        }
+
+        /// <summary>
+        /// Partial update: re-check cells within the given world-space bounds
+        /// against BOTH static and dynamic masks.
+        /// Used by ObstacleTracker when dynamic obstacles appear/move/die.
+        ///
+        /// Critical: this re-evaluates walkability from scratch for the region.
+        /// If a dynamic obstacle was removed, cells become walkable again
+        /// (unless a static obstacle still occupies them).
+        /// </summary>
+        public void UpdateRegion(Bounds worldBounds)
+        {
+            Vector2Int min = WorldToGrid(worldBounds.min);
+            Vector2Int max = WorldToGrid(worldBounds.max);
+            Vector3 halfExtents = BuildHalfExtents();
+            LayerMask combinedMask = _settings.staticObstacleMask | _settings.dynamicObstacleMask;
+
+            for (int z = min.y; z <= max.y; z++)
+            {
+                for (int x = min.x; x <= max.x; x++)
+                {
+                    Vector3 center = GridToWorld(x, z);
+                    center.y += _settings.obstacleCheckHeight * 0.5f;
+
+                    bool blocked = Physics.CheckBox(
+                        center, halfExtents,
+                        Quaternion.identity, combinedMask,
+                        QueryTriggerInteraction.Ignore
+                    );
+
+                    _walkable[z * _settings.width + x] = !blocked;
+                }
+            }
+            
+            ApplyErosionRegion(min, max);
+        }
+        
+        /// <summary>
+        /// Marks cells near obstacles as unwalkable based on agent radius.
+        /// Prevents paths from clipping through obstacle corners after smoothing.
+        /// Call after BakeStaticObstacles() or UpdateRegion().
+        /// </summary>
+        public void ApplyErosion()
+        {
+            int erodeSteps = Mathf.CeilToInt(_settings.agentRadius / _settings.cellSize);
+            if (erodeSteps <= 0) return;
+
+            // Work on a copy — don't erode based on already-eroded cells
+            int total = _settings.width * _settings.height;
+            bool[] original = new bool[total];
+            System.Array.Copy(_walkable, original, total);
+
+            for (int z = 0; z < _settings.height; z++)
+            {
+                for (int x = 0; x < _settings.width; x++)
+                {
+                    // Only process originally blocked cells
+                    if (original[z * _settings.width + x]) continue;
+
+                    // Mark neighbors within erodeSteps as unwalkable
+                    for (int dz = -erodeSteps; dz <= erodeSteps; dz++)
+                    {
+                        for (int dx = -erodeSteps; dx <= erodeSteps; dx++)
+                        {
+                            if (dx == 0 && dz == 0) continue;
+
+                            int nx = x + dx;
+                            int nz = z + dz;
+                            if (!InBounds(nx, nz)) continue;
+
+                            // Circular erosion — not square
+                            float dist = Mathf.Sqrt(dx * dx + dz * dz);
+                            if (dist <= erodeSteps)
+                                _walkable[nz * _settings.width + nx] = false;
+                        }
+                    }
+                }
+            }
+        }
+        
+        /// <summary>
+        /// Erosion limited to a grid region. Reads from full grid, writes only within bounds.
+        /// </summary>
+        private void ApplyErosionRegion(Vector2Int min, Vector2Int max)
+        {
+            int erodeSteps = Mathf.CeilToInt(_settings.agentRadius / _settings.cellSize);
+            if (erodeSteps <= 0) return;
+
+            // Snapshot current state for the region + erosion margin
+            int snapMinX = Mathf.Max(0, min.x - erodeSteps);
+            int snapMinZ = Mathf.Max(0, min.y - erodeSteps);
+            int snapMaxX = Mathf.Min(_settings.width - 1, max.x + erodeSteps);
+            int snapMaxZ = Mathf.Min(_settings.height - 1, max.y + erodeSteps);
+
+            for (int z = snapMinZ; z <= snapMaxZ; z++)
+            {
+                for (int x = snapMinX; x <= snapMaxX; x++)
+                {
+                    if (_walkable[z * _settings.width + x]) continue; // only erode from blocked
+
+                    for (int dz = -erodeSteps; dz <= erodeSteps; dz++)
+                    {
+                        for (int dx = -erodeSteps; dx <= erodeSteps; dx++)
+                        {
+                            if (dx == 0 && dz == 0) continue;
+
+                            int nx = x + dx;
+                            int nz = z + dz;
+                            if (!InBounds(nx, nz)) continue;
+
+                            float dist = Mathf.Sqrt(dx * dx + dz * dz);
+                            if (dist <= erodeSteps)
+                                _walkable[nz * _settings.width + nx] = false;
+                        }
+                    }
+                }
+            }
+        }
+
+        /// <summary>
+        /// Returns the raw walkability array for read access (solver, debug).
+        /// Do not modify directly — use SetWalkable or UpdateRegion.
+        /// </summary>
+        public bool[] GetRawGrid() => _walkable;
+
+        // ───────────── Internal ─────────────
+
+        private Vector3 BuildHalfExtents()
+        {
+            return new Vector3(
+                _settings.cellSize * 0.45f,
+                _settings.obstacleCheckHeight * 0.5f,
+                _settings.cellSize * 0.45f
+            );
+        }
+    }
+}
