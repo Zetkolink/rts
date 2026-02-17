@@ -84,13 +84,10 @@ namespace RTS.Pathfinding
 
         private static void MoveGroup(UnitPathFollower[] group, Vector3 destination)
         {
-            if (group == null) return;
+            if (group == null || group.Length == 0) return;
 
-            for (int i = 0; i < group.Length; i++)
-            {
-                var u = group[i];
-                if (u != null) u.MoveTo(destination);
-            }
+            // Use GroupMoveCommand for formation-based movement
+            GroupMoveCommand.Execute(group, destination);
         }
     }
 }

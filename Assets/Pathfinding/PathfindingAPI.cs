@@ -80,26 +80,31 @@ namespace RTS.Pathfinding
             Vector3 start,
             Vector3 end,
             Action<PathResult> callback,
-            float priority = 0f)
+            float priority = 0f,
+            ClearanceClass clearance = ClearanceClass.Small)
         {
-            return _scheduler.Enqueue(start, end, callback, priority);
+            return _scheduler.Enqueue(start, end, callback, priority, clearance);
         }
 
         /// <summary>
         /// Synchronous path request. Blocks until complete.
         /// Use sparingly — only for single critical paths (player click).
         /// </summary>
-        public PathResult RequestPathImmediate(Vector3 start, Vector3 end)
+        public PathResult RequestPathImmediate(
+            Vector3 start,
+            Vector3 end,
+            ClearanceClass clearance = ClearanceClass.Small)
         {
             var gridStart = _grid.WorldToGrid(start);
             var gridEnd = _grid.WorldToGrid(end);
 
-            var result = _solver.Solve(_grid.GetNavGrid(), gridStart, gridEnd);
+            bool[] navGrid = _grid.GetNavGrid(clearance);
+            var result = _solver.Solve(navGrid, gridStart, gridEnd);
 
             if (result.Status == PathStatus.Found || result.Status == PathStatus.Partial)
             {
                 result.Waypoints = PathSmoother.Smooth(
-                    result.RawCells, _grid.GetNavGrid(), _grid.Width, _grid);
+                    result.RawCells, navGrid, _grid.Width, _grid);
 
                 result.PathLength = 0f;
                 for (int i = 1; i < result.Waypoints.Length; i++)
@@ -113,10 +118,17 @@ namespace RTS.Pathfinding
         /// <summary>Cancel a pending path request.</summary>
         public bool CancelRequest(int requestId) => _scheduler.Cancel(requestId);
 
-        /// <summary>Check if a world position is on a walkable cell.</summary>
+        /// <summary>Check if a world position is on a walkable cell (raw grid).</summary>
         public bool IsPositionWalkable(Vector3 worldPos)
         {
-            return _grid.IsPositionValid(worldPos); // uses raw grid
+            return _grid.IsPositionValid(worldPos);
+        }
+
+        /// <summary>Check if a world position is nav-walkable for a given clearance class.</summary>
+        public bool IsPositionWalkable(Vector3 worldPos, ClearanceClass clearance)
+        {
+            var cell = _grid.WorldToGrid(worldPos);
+            return _grid.IsNavWalkable(cell, clearance);
         }
         
         /// <summary>

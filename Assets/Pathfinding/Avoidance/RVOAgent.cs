@@ -16,7 +16,9 @@ namespace RTS.Pathfinding.Avoidance
     public sealed class RVOAgent : MonoBehaviour
     {
         [Header("Agent Properties")]
+        [Tooltip("Fallback radius if no UnitProfile assigned.")]
         [SerializeField] private float _radius = 0.5f;
+        [Tooltip("Fallback max speed if no UnitProfile assigned.")]
         [SerializeField] private float _maxSpeed = 5f;
 
         [Header("Tuning")]
@@ -30,7 +32,17 @@ namespace RTS.Pathfinding.Avoidance
 
         // ── Public state ──
         public Vector3 ComputedVelocity => _computedVelocity;
-        public float Radius => _radius;
+
+        /// <summary>Effective radius: from profile if available, else serialized fallback.</summary>
+        public float Radius => _follower != null && _follower.Profile != null
+            ? _follower.Profile.radius
+            : _radius;
+
+        /// <summary>Effective max speed: from profile if available, else serialized fallback.</summary>
+        public float MaxSpeed => _follower != null && _follower.Profile != null
+            ? _follower.Profile.moveSpeed
+            : _maxSpeed;
+
         public bool IsRegistered => _registered;
 
         private void Awake()
@@ -68,8 +80,8 @@ namespace RTS.Pathfinding.Avoidance
             if (_rvoId >= 0 && !_registered)
             {
                 var sim = RVO.Simulator.Instance;
-                sim.setAgentRadius(_rvoId, _radius);
-                sim.setAgentMaxSpeed(_rvoId, _maxSpeed);
+                sim.setAgentRadius(_rvoId, Radius);
+                sim.setAgentMaxSpeed(_rvoId, MaxSpeed);
                 _registered = true;
             }
         }
@@ -84,12 +96,12 @@ namespace RTS.Pathfinding.Avoidance
 
             _rvoId = sim.addAgent(
                 pos,
-                RVOSimulatorBridge.Instance != null ? 5f : 5f, // neighborDist
-                10,                                              // maxNeighbors
-                2f,                                              // timeHorizon
-                1f,                                              // timeHorizonObst
-                _radius,
-                _maxSpeed,
+                5f,                     // neighborDist
+                10,                     // maxNeighbors
+                2f,                     // timeHorizon
+                1f,                     // timeHorizonObst
+                Radius,                 // use effective radius from profile
+                MaxSpeed,               // use effective speed from profile
                 new RVO.Vector2(0f, 0f)
             );
 
@@ -121,7 +133,7 @@ namespace RTS.Pathfinding.Avoidance
                 if (distance > 0.01f)
                 {
                     Vector3 dir = toWaypoint / distance;
-                    float speed = _maxSpeed * _follower.SpeedMultiplier;
+                    float speed = MaxSpeed * _follower.SpeedMultiplier;
 
                     if (distance < _arrivalSlowdownRadius)
                         speed *= distance / _arrivalSlowdownRadius;
@@ -197,7 +209,7 @@ namespace RTS.Pathfinding.Avoidance
         {
             // Avoidance radius
             Gizmos.color = new Color(1f, 1f, 0f, 0.3f);
-            Gizmos.DrawWireSphere(transform.position, _radius);
+            Gizmos.DrawWireSphere(transform.position, Radius);
 
             if (!Application.isPlaying) return;
 

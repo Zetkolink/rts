@@ -10,6 +10,10 @@ namespace RTS.Pathfinding
     /// </summary>
     public sealed class UnitPathFollower : MonoBehaviour
     {
+        [Header("Profile")]
+        [Tooltip("Unit profile ScriptableObject. Overrides speed/rotation if assigned.")]
+        [SerializeField] private UnitProfile _profile;
+
         [Header("Movement")] [SerializeField] private float _baseSpeed = 5f;
         [SerializeField] private float _waypointReachedThreshold = 0.15f;
         [SerializeField] private float _rotationSpeed = 720f;
@@ -22,6 +26,7 @@ namespace RTS.Pathfinding
         private bool _hasPath;
         private Vector3 _finalDestination;
         private Vector3 _lastMoveDirection;
+        private ClearanceClass _activeClearance = ClearanceClass.Small;
 
         // Stuck detection
         private int _stuckFrames;
@@ -35,11 +40,20 @@ namespace RTS.Pathfinding
 
         // ───────────── Public Read-Only State ─────────────
 
+        /// <summary>Assigned UnitProfile. May be null if not set.</summary>
+        public UnitProfile Profile => _profile;
+
+        /// <summary>Effective base speed (profile overrides serialized value).</summary>
+        public float BaseSpeed => _profile != null ? _profile.moveSpeed : _baseSpeed;
+
+        /// <summary>Effective rotation speed (profile overrides serialized value).</summary>
+        public float RotationSpeed => _profile != null ? _profile.rotationSpeed : _rotationSpeed;
+
         /// <summary>Current movement speed in world units/sec.</summary>
         public float CurrentSpeed { get; private set; }
 
         /// <summary>Speed normalized to [0..1] range. Use for blend trees.</summary>
-        public float NormalizedSpeed => _baseSpeed > 0f ? CurrentSpeed / _baseSpeed : 0f;
+        public float NormalizedSpeed => BaseSpeed > 0f ? CurrentSpeed / BaseSpeed : 0f;
 
         /// <summary>True if unit has a path and hasn't reached the end.</summary>
         public bool HasPath => _hasPath;
@@ -62,10 +76,19 @@ namespace RTS.Pathfinding
         /// </summary>
         public float SpeedMultiplier { get; set; } = 1f;
 
+        /// <summary>The clearance class used for the current/last path request.</summary>
+        public ClearanceClass ActiveClearance => _activeClearance;
+
         private void Awake()
         {
             _rvoAgent = GetComponent<RTS.Pathfinding.Avoidance.RVOAgent>();
             _hasRVO = _rvoAgent != null;
+
+            // Apply profile defaults
+            if (_profile != null)
+            {
+                _activeClearance = _profile.clearanceClass;
+            }
         }
 
         // ───────────── Public API ─────────────
@@ -73,11 +96,25 @@ namespace RTS.Pathfinding
         /// <summary>
         /// Request unit to move to world position.
         /// Cancels any active path/request.
+        /// Uses profile's clearance class by default.
         /// </summary>
         public void MoveTo(Vector3 destination)
         {
+            ClearanceClass clearance = _profile != null
+                ? _profile.clearanceClass
+                : ClearanceClass.Small;
+            MoveTo(destination, clearance);
+        }
+
+        /// <summary>
+        /// Request unit to move to world position with explicit clearance class.
+        /// Cancels any active path/request.
+        /// </summary>
+        public void MoveTo(Vector3 destination, ClearanceClass clearance)
+        {
             Stop();
             _finalDestination = destination;
+            _activeClearance = clearance;
 
             if (PathfindingAPI.Instance == null)
             {
@@ -89,7 +126,8 @@ namespace RTS.Pathfinding
                 transform.position,
                 destination,
                 OnPathReceived,
-                priority: 0f
+                priority: 0f,
+                clearance: _activeClearance
             );
         }
 
@@ -186,7 +224,7 @@ namespace RTS.Pathfinding
                 // Behind us (dot < 0) and close = bad, skip it
                 // Ahead of us (dot > 0) and close = good, start here
                 // Far away = probably a real waypoint, don't skip
-                if (dot < 0f && distance < _baseSpeed * 0.5f)
+                if (dot < 0f && distance < BaseSpeed * 0.5f)
                     continue;
 
                 // Score: prefer close + ahead
@@ -223,7 +261,7 @@ namespace RTS.Pathfinding
                     Debug.Log($"[UnitPathFollower] {gameObject.name}: stuck, requesting repath");
                     _stuckFrames = 0;
                     Vector3 dest = _finalDestination;
-                    MoveTo(dest);
+                    MoveTo(dest, _activeClearance);
                     return;
                 }
             }
@@ -248,7 +286,7 @@ namespace RTS.Pathfinding
                 {
                     Vector3 rvoDir = _rvoAgent.ComputedVelocity.normalized;
                     float dot = Vector3.Dot(rvoDir, toTarget.normalized);
-                    rvoPushingAway = dot < 0.2f && distToFinal < _baseSpeed * 1.5f;
+                    rvoPushingAway = dot < 0.2f && distToFinal < BaseSpeed * 1.5f;
                 }
 
                 // Not making progress toward destination — area is full
@@ -306,7 +344,7 @@ namespace RTS.Pathfinding
                 transform.rotation = Quaternion.RotateTowards(
                     transform.rotation,
                     targetRotation,
-                    _rotationSpeed * Time.deltaTime
+                    RotationSpeed * Time.deltaTime
                 );
             }
         }

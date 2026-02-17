@@ -14,6 +14,7 @@ namespace RTS.Pathfinding
         public Action<PathResult> Callback;
         public float Priority;       // lower = processed first
         public float TimeRequested;
+        public ClearanceClass Clearance;
     }
 
     /// <summary>
@@ -47,7 +48,8 @@ namespace RTS.Pathfinding
             Vector3 start,
             Vector3 end,
             Action<PathResult> callback,
-            float priority = 0f)
+            float priority = 0f,
+            ClearanceClass clearance = ClearanceClass.Small)
         {
             int id = _nextId++;
             _queue.Add(new PathRequest
@@ -57,7 +59,8 @@ namespace RTS.Pathfinding
                 End = end,
                 Callback = callback,
                 Priority = priority,
-                TimeRequested = Time.time
+                TimeRequested = Time.time,
+                Clearance = clearance
             });
             return id;
         }
@@ -104,14 +107,15 @@ namespace RTS.Pathfinding
                 double remainingMs = _frameBudgetMs - timer.Elapsed.TotalMilliseconds;
                 int maxIter = Mathf.Max(500, (int)(remainingMs * 3000));
 
-                var result = _solver.Solve(_grid.GetNavGrid(), gridStart, gridEnd, maxIter);
+                bool[] navGrid = _grid.GetNavGrid(request.Clearance);
+                var result = _solver.Solve(navGrid, gridStart, gridEnd, maxIter);
                 result.RequestId = request.Id;
 
                 // Smooth if path found
                 if (result.Status == PathStatus.Found || result.Status == PathStatus.Partial)
                 {
                     result.Waypoints = PathSmoother.Smooth(
-                        result.RawCells, _grid.GetNavGrid(), _grid.Width, _grid);
+                        result.RawCells, navGrid, _grid.Width, _grid);
 
                     // Calculate total path length
                     result.PathLength = 0f;

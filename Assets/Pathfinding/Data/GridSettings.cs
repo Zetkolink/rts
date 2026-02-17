@@ -28,8 +28,31 @@ namespace RTS.Pathfinding
         [Tooltip("Height of the overlap box used for obstacle checks")]
         [Min(0.1f)] public float obstacleCheckHeight = 2f;
         
-        [Header("Agent")]
-        [Tooltip("Agent radius in world units. Obstacles are expanded by this amount.")]
+        [Header("Agent — Multi-Clearance")]
+        [Tooltip("Default agent radius (backwards compat). Also used as Small clearance radius.")]
         [Min(0f)] public float agentRadius = 0.4f;
+
+        [Tooltip("Erosion radius for Small clearance class (world units).")]
+        [Min(0f)] public float clearanceRadiusSmall = 0.4f;
+
+        [Tooltip("Erosion radius for Medium clearance class (world units).")]
+        [Min(0f)] public float clearanceRadiusMedium = 0.8f;
+
+        [Tooltip("Erosion radius for Large clearance class (world units).")]
+        [Min(0f)] public float clearanceRadiusLarge = 1.5f;
+
+        /// <summary>
+        /// Returns the erosion radius for a given clearance class.
+        /// </summary>
+        public float GetClearanceRadius(ClearanceClass clearance)
+        {
+            switch (clearance)
+            {
+                case ClearanceClass.Small:  return clearanceRadiusSmall;
+                case ClearanceClass.Medium: return clearanceRadiusMedium;
+                case ClearanceClass.Large:  return clearanceRadiusLarge;
+                default:                    return agentRadius;
+            }
+        }
     }
 }

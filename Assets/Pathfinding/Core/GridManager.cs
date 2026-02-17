@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using UnityEngine;
 
 namespace RTS.Pathfinding
@@ -7,22 +8,47 @@ namespace RTS.Pathfinding
         // Raw grid: actual physics, no erosion
         private readonly bool[] _rawWalkable;
 
-        // Navigation grid: raw + erosion applied. Used by A* solver.
+        // Navigation grids: one per clearance class, each with different erosion
+        private readonly Dictionary<ClearanceClass, bool[]> _navGrids;
+
+        // Legacy single nav grid — points to Small clearance for backwards compat
         private readonly bool[] _navWalkable;
 
         private readonly GridSettings _settings;
+
+        // Pre-computed erode steps per clearance class
+        private readonly Dictionary<ClearanceClass, int> _erodeSteps;
 
         public int Width => _settings.width;
         public int Height => _settings.height;
         public float CellSize => _settings.cellSize;
         public Vector3 WorldOrigin => _settings.worldOrigin;
 
+        private static readonly ClearanceClass[] AllClasses =
+        {
+            ClearanceClass.Small,
+            ClearanceClass.Medium,
+            ClearanceClass.Large
+        };
+
         public GridManager(GridSettings settings)
         {
             _settings = settings;
             int total = settings.width * settings.height;
             _rawWalkable = new bool[total];
-            _navWalkable = new bool[total];
+
+            _navGrids = new Dictionary<ClearanceClass, bool[]>(3);
+            _erodeSteps = new Dictionary<ClearanceClass, int>(3);
+
+            foreach (var cls in AllClasses)
+            {
+                _navGrids[cls] = new bool[total];
+                float radius = settings.GetClearanceRadius(cls);
+                _erodeSteps[cls] = Mathf.CeilToInt(radius / settings.cellSize);
+            }
+
+            // Legacy compat: _navWalkable is the Small grid
+            _navWalkable = _navGrids[ClearanceClass.Small];
         }
 
         // ───────────── Coordinate Conversion ─────────────
@@ -68,8 +94,8 @@ namespace RTS.Pathfinding
         public bool IsRawWalkable(Vector2Int cell) => IsRawWalkable(cell.x, cell.y);
 
         /// <summary>
-        /// Navigation walkability (raw + erosion). Use for pathfinding:
-        /// "can an agent of agentRadius traverse this cell safely?"
+        /// Navigation walkability for default (Small) clearance.
+        /// Backwards-compatible with existing callers.
         /// </summary>
         public bool IsNavWalkable(int x, int z)
         {
@@ -78,6 +104,18 @@ namespace RTS.Pathfinding
         }
 
         public bool IsNavWalkable(Vector2Int cell) => IsNavWalkable(cell.x, cell.y);
+
+        /// <summary>
+        /// Navigation walkability for a specific clearance class.
+        /// </summary>
+        public bool IsNavWalkable(int x, int z, ClearanceClass clearance)
+        {
+            if (!InBounds(x, z)) return false;
+            return _navGrids[clearance][z * _settings.width + x];
+        }
+
+        public bool IsNavWalkable(Vector2Int cell, ClearanceClass clearance) =>
+            IsNavWalkable(cell.x, cell.y, clearance);
 
         /// <summary>
         /// Combined check: position is valid if raw-walkable.
@@ -94,7 +132,8 @@ namespace RTS.Pathfinding
             if (!InBounds(x, z)) return;
             int idx = z * _settings.width + x;
             _rawWalkable[idx] = walkable;
-            _navWalkable[idx] = walkable;
+            foreach (var cls in AllClasses)
+                _navGrids[cls][idx] = walkable;
         }
 
         // ───────────── Bake ─────────────
@@ -119,18 +158,23 @@ namespace RTS.Pathfinding
 
                     int idx = z * _settings.width + x;
                     _rawWalkable[idx] = !blocked;
-                    _navWalkable[idx] = !blocked;
+                    foreach (var cls in AllClasses)
+                        _navGrids[cls][idx] = !blocked;
                 }
             }
 
-            RebuildNavGrid();
+            RebuildAllNavGrids();
         }
 
         public void UpdateRegion(Bounds worldBounds)
         {
-            float erodeWorld = _settings.agentRadius;
+            // Use largest clearance radius for expansion to ensure all grids are correct
+            float maxRadius = Mathf.Max(
+                _settings.clearanceRadiusSmall,
+                Mathf.Max(_settings.clearanceRadiusMedium, _settings.clearanceRadiusLarge)
+            );
             Bounds expandedBounds = worldBounds;
-            expandedBounds.Expand(erodeWorld * 2f);
+            expandedBounds.Expand(maxRadius * 2f);
 
             Vector2Int min = WorldToGrid(expandedBounds.min);
             Vector2Int max = WorldToGrid(expandedBounds.max);
@@ -156,71 +200,68 @@ namespace RTS.Pathfinding
                 }
             }
 
-            // Rebuild nav grid for this region
-            RebuildNavGridRegion(min, max);
+            // Rebuild all nav grids for this region
+            foreach (var cls in AllClasses)
+                RebuildNavGridRegion(cls, min, max);
         }
 
-        // ───────────── Navigation Grid (erosion) ─────────────
+        // ───────────── Navigation Grids (multi-clearance erosion) ─────────────
 
-        /// <summary>
-        /// Full rebuild: copy raw → nav, then erode.
-        /// Called after BakeStaticObstacles.
-        /// </summary>
-        private void RebuildNavGrid()
+        private void RebuildAllNavGrids()
+        {
+            foreach (var cls in AllClasses)
+                RebuildNavGrid(cls);
+        }
+
+        private void RebuildNavGrid(ClearanceClass clearance)
         {
             int total = _settings.width * _settings.height;
-            System.Array.Copy(_rawWalkable, _navWalkable, total);
+            bool[] navGrid = _navGrids[clearance];
+            System.Array.Copy(_rawWalkable, navGrid, total);
 
-            int erodeSteps = Mathf.CeilToInt(_settings.agentRadius / _settings.cellSize);
-            if (erodeSteps <= 0) return;
+            int erode = _erodeSteps[clearance];
+            if (erode <= 0) return;
 
-            // Erode: for each blocked cell in raw, block neighbors in nav
             for (int z = 0; z < _settings.height; z++)
             {
                 for (int x = 0; x < _settings.width; x++)
                 {
                     if (_rawWalkable[z * _settings.width + x]) continue;
-                    ErodeAround(x, z, erodeSteps);
+                    ErodeAround(navGrid, x, z, erode);
                 }
             }
         }
 
-        /// <summary>
-        /// Regional rebuild: reset nav from raw, then erode.
-        /// Reads raw grid beyond region borders for correct erosion at edges.
-        /// </summary>
-        private void RebuildNavGridRegion(Vector2Int min, Vector2Int max)
+        private void RebuildNavGridRegion(ClearanceClass clearance, Vector2Int min, Vector2Int max)
         {
-            int erodeSteps = Mathf.CeilToInt(_settings.agentRadius / _settings.cellSize);
+            int erode = _erodeSteps[clearance];
+            bool[] navGrid = _navGrids[clearance];
 
             // Reset nav = raw for the region
             for (int z = min.y; z <= max.y; z++)
                 for (int x = min.x; x <= max.x; x++)
-                    _navWalkable[z * _settings.width + x] = _rawWalkable[z * _settings.width + x];
+                    navGrid[z * _settings.width + x] = _rawWalkable[z * _settings.width + x];
 
-            if (erodeSteps <= 0) return;
+            if (erode <= 0) return;
 
-            // Scan wider area for erosion sources (blocked cells outside region
-            // can erode INTO the region)
-            int scanMinX = Mathf.Max(0, min.x - erodeSteps);
-            int scanMinZ = Mathf.Max(0, min.y - erodeSteps);
-            int scanMaxX = Mathf.Min(_settings.width - 1, max.x + erodeSteps);
-            int scanMaxZ = Mathf.Min(_settings.height - 1, max.y + erodeSteps);
+            int scanMinX = Mathf.Max(0, min.x - erode);
+            int scanMinZ = Mathf.Max(0, min.y - erode);
+            int scanMaxX = Mathf.Min(_settings.width - 1, max.x + erode);
+            int scanMaxZ = Mathf.Min(_settings.height - 1, max.y + erode);
 
             for (int z = scanMinZ; z <= scanMaxZ; z++)
             {
                 for (int x = scanMinX; x <= scanMaxX; x++)
                 {
                     if (_rawWalkable[z * _settings.width + x]) continue;
-
-                    // Only erode targets within the original region
-                    ErodeAroundClamped(x, z, erodeSteps, min, max);
+                    ErodeAroundClamped(navGrid, x, z, erode, min, max);
                 }
             }
         }
 
-        private void ErodeAround(int cx, int cz, int erodeSteps)
+        private void ErodeAround(bool[] navGrid, int cx, int cz, int erodeSteps)
         {
+            int radiusSq = erodeSteps * erodeSteps;
             for (int dz = -erodeSteps; dz <= erodeSteps; dz++)
             {
                 for (int dx = -erodeSteps; dx <= erodeSteps; dx++)
@@ -231,15 +272,16 @@ namespace RTS.Pathfinding
                     int nz = cz + dz;
                     if (!InBounds(nx, nz)) continue;
 
-                    // Circular erosion
-                    if (dx * dx + dz * dz <= erodeSteps * erodeSteps)
-                        _navWalkable[nz * _settings.width + nx] = false;
+                    if (dx * dx + dz * dz <= radiusSq)
+                        navGrid[nz * _settings.width + nx] = false;
                 }
             }
         }
 
-        private void ErodeAroundClamped(int cx, int cz, int erodeSteps, Vector2Int min, Vector2Int max)
+        private void ErodeAroundClamped(bool[] navGrid, int cx, int cz, int erodeSteps,
+            Vector2Int min, Vector2Int max)
         {
+            int radiusSq = erodeSteps * erodeSteps;
             for (int dz = -erodeSteps; dz <= erodeSteps; dz++)
             {
                 for (int dx = -erodeSteps; dx <= erodeSteps; dx++)
@@ -249,19 +291,21 @@ namespace RTS.Pathfinding
                     int nx = cx + dx;
                     int nz = cz + dz;
 
-                    // Only write within target region
                     if (nx < min.x || nx > max.x || nz < min.y || nz > max.y) continue;
 
-                    if (dx * dx + dz * dz <= erodeSteps * erodeSteps)
-                        _navWalkable[nz * _settings.width + nx] = false;
+                    if (dx * dx + dz * dz <= radiusSq)
+                        navGrid[nz * _settings.width + nx] = false;
                 }
             }
         }
 
         // ───────────── Grid Accessors for Solver ─────────────
 
-        /// <summary>Navigation grid for A* solver.</summary>
+        /// <summary>Navigation grid for default (Small) clearance. Backwards compat.</summary>
         public bool[] GetNavGrid() => _navWalkable;
+
+        /// <summary>Navigation grid for a specific clearance class.</summary>
+        public bool[] GetNavGrid(ClearanceClass clearance) => _navGrids[clearance];
 
         /// <summary>Raw grid for debug overlay and position validation.</summary>
         public bool[] GetRawGrid() => _rawWalkable;
