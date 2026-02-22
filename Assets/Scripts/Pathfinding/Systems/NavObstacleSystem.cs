@@ -2,28 +2,17 @@ using System.Collections.Generic;
 using Pathfinding.Movement.ECS;
 using Unity.Collections;
 using Unity.Entities;
+using Unity.Mathematics;
 using Unity.Transforms;
 using UnityEngine;
 using UnityEngine.AI;
 
 namespace Pathfinding.Systems
 {
-    /// <summary>
-    /// Manages runtime <see cref="NavMeshObstacle"/> GameObjects for entities with
-    /// <see cref="NavObstacleConfig"/>.
-    ///
-    /// Uses <see cref="NavObstacleCleanup"/> (ICleanupComponentData) to guarantee
-    /// GO destruction — ECS will not fully destroy an entity until cleanup is removed.
-    ///
-    /// Reacts only to state transitions — zero work while unit stays idle or keeps moving.
-    ///
-    /// Main thread — managed GO access.
-    /// </summary>
     [UpdateInGroup(typeof(SimulationSystemGroup))]
     [UpdateBefore(typeof(DeferredMoveSystem))]
     public partial class NavObstacleSystem : SystemBase
     {
-        /// <summary>Managed storage: Entity → runtime GO. Single source of truth.</summary>
         private readonly Dictionary<Entity, NavObstacleInstance> _instances = new(256);
 
         private struct NavObstacleInstance
@@ -42,12 +31,10 @@ namespace Pathfinding.Systems
         {
             CreateObstacles();
             HandleTransitions();
+            SyncStoppedPositions();
             CleanupDestroyed();
         }
 
-        /// <summary>
-        /// Spawn runtime GameObjects for entities that have config but no cleanup marker yet.
-        /// </summary>
         private void CreateObstacles()
         {
             var pending = new NativeList<Entity>(16, Allocator.Temp);
@@ -60,6 +47,15 @@ namespace Pathfinding.Systems
                 pending.Add(entity);
             }
 
+            if (pending.Length == 0)
+            {
+                pending.Dispose();
+                return;
+            }
+
+            // Batch structural change — one archetype move for all entities.
+            var ecb = new EntityCommandBuffer(Allocator.Temp);
+
             for (int i = 0; i < pending.Length; i++)
             {
                 var entity = pending[i];
@@ -68,6 +64,9 @@ namespace Pathfinding.Systems
 
                 var config = EntityManager.GetComponentData<NavObstacleConfig>(entity);
                 var transform = EntityManager.GetComponentData<LocalTransform>(entity);
+
+                // Check current movement state at creation time.
+                bool isMoving = IsEntityMoving(entity);
 
                 var go = new GameObject($"NavObstacle_{entity.Index}_{entity.Version}");
                 go.hideFlags = HideFlags.DontSave;
@@ -78,27 +77,42 @@ namespace Pathfinding.Systems
                 obstacle.radius = config.Radius;
                 obstacle.height = config.Height;
                 obstacle.carving = true;
-                obstacle.enabled = true;
+                obstacle.enabled = !isMoving; // ← disabled if already moving
 
                 _instances[entity] = new NavObstacleInstance
                 {
                     Go = go,
                     Obstacle = obstacle,
-                    WasMoving = false,
+                    WasMoving = isMoving, // ← correct initial state
                 };
 
-                EntityManager.AddComponent<NavObstacleCleanup>(entity);
+                ecb.AddComponent<NavObstacleCleanup>(entity);
             }
 
+            ecb.Playback(EntityManager);
+            ecb.Dispose();
             pending.Dispose();
         }
 
-        /// <summary>
-        /// Detect moving→stopped and stopped→moving transitions.
-        /// Only those frames do any work.
-        /// </summary>
+        private bool IsEntityMoving(Entity entity)
+        {
+            if (EntityManager.HasComponent<IsMovingTag>(entity)
+                && EntityManager.IsComponentEnabled<IsMovingTag>(entity))
+                return true;
+
+            if (EntityManager.HasComponent<DeferredMove>(entity))
+            {
+                var deferred = EntityManager.GetComponentData<DeferredMove>(entity);
+                if (deferred.FramesLeft > 0)
+                    return true;
+            }
+
+            return false;
+        }
+
         private void HandleTransitions()
         {
+            // Primary path — entities with DeferredMove.
             foreach (var (transform, deferred, isMoving, entity) in
                      SystemAPI.Query<RefRO<LocalTransform>, RefRO<DeferredMove>,
                              EnabledRefRO<IsMovingTag>>()
@@ -106,35 +120,81 @@ namespace Pathfinding.Systems
                          .WithOptions(EntityQueryOptions.IgnoreComponentEnabledState)
                          .WithEntityAccess())
             {
-                if (!_instances.TryGetValue(entity, out var inst))
-                    continue;
-                if (inst.Go == null)
+                if (!_instances.TryGetValue(entity, out var inst) || inst.Go == null)
                     continue;
 
                 bool moving = isMoving.ValueRO || deferred.ValueRO.FramesLeft > 0;
+                ApplyTransition(entity, ref inst, moving, transform.ValueRO.Position);
+            }
 
-                if (moving == inst.WasMoving)
+            // Fallback — entities WITHOUT DeferredMove (freshly spawned, buildings, etc).
+            foreach (var (transform, isMoving, entity) in
+                     SystemAPI.Query<RefRO<LocalTransform>, EnabledRefRO<IsMovingTag>>()
+                         .WithAll<NavObstacleCleanup>()
+                         .WithNone<DeferredMove>()
+                         .WithOptions(EntityQueryOptions.IgnoreComponentEnabledState)
+                         .WithEntityAccess())
+            {
+                if (!_instances.TryGetValue(entity, out var inst) || inst.Go == null)
                     continue;
 
-                inst.WasMoving = moving;
-                _instances[entity] = inst;
+                bool moving = isMoving.ValueRO;
+                ApplyTransition(entity, ref inst, moving, transform.ValueRO.Position);
+            }
+        }
 
-                if (moving)
+        private void ApplyTransition(Entity entity, ref NavObstacleInstance inst, 
+                                     bool moving, float3 position)
+        {
+            if (moving == inst.WasMoving)
+                return;
+
+            inst.WasMoving = moving;
+
+            if (moving)
+            {
+                inst.Obstacle.enabled = false;
+            }
+            else
+            {
+                inst.Go.transform.position = position;
+                inst.Obstacle.enabled = true;
+            }
+
+            _instances[entity] = inst;
+        }
+
+        /// <summary>
+        /// Safety net: sync position for stopped entities that might have been
+        /// repositioned externally (formation shuffle, push, teleport).
+        /// Runs only for enabled obstacles — cheap float3 comparison.
+        /// </summary>
+        private void SyncStoppedPositions()
+        {
+            foreach (var (transform, entity) in
+                     SystemAPI.Query<RefRO<LocalTransform>>()
+                         .WithAll<NavObstacleCleanup>()
+                         .WithEntityAccess())
+            {
+                if (!_instances.TryGetValue(entity, out var inst))
+                    continue;
+                if (inst.Go == null || inst.WasMoving || !inst.Obstacle.enabled)
+                    continue;
+
+                var pos = transform.ValueRO.Position;
+                var goPos = inst.Go.transform.position;
+
+                const float toleranceSq = 0.01f; // 10cm
+                float dx = pos.x - goPos.x;
+                float dz = pos.z - goPos.z;
+
+                if (dx * dx + dz * dz > toleranceSq)
                 {
-                    inst.Obstacle.enabled = false;
-                }
-                else
-                {
-                    inst.Go.transform.position = transform.ValueRO.Position;
-                    inst.Obstacle.enabled = true;
+                    inst.Go.transform.position = pos;
                 }
             }
         }
 
-        /// <summary>
-        /// Detect zombie entities: have Cleanup but lost Config (= entity was destroyed).
-        /// ECS kept them alive for us. Now we clean up GO and let them die.
-        /// </summary>
         private void CleanupDestroyed()
         {
             var zombies = new NativeList<Entity>(8, Allocator.Temp);

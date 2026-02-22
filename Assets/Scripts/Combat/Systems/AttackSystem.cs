@@ -18,18 +18,36 @@ namespace Combat.Systems
     /// Main thread — target validation + pool access.
     /// </summary>
     [UpdateInGroup(typeof(SimulationSystemGroup))]
+    [UpdateAfter(typeof(VelocityTrackingSystem))]
     [UpdateBefore(typeof(TransformSystemGroup))]
     public partial class AttackSystem : SystemBase
     {
+        private ComponentLookup<LocalTransform> _transformLookup;
+        private ComponentLookup<Health> _healthLookup;
+        private ComponentLookup<IsDeadTag> _isDeadLookup;
+        private ComponentLookup<TrackedVelocity> _velocityLookup;
+
         protected override void OnCreate()
         {
             RequireForUpdate<WeaponConfig>();
             RequireForUpdate<ProjectilePoolConfig>();
+
+            _transformLookup = GetComponentLookup<LocalTransform>(true);
+            _healthLookup = GetComponentLookup<Health>(true);
+            _isDeadLookup = GetComponentLookup<IsDeadTag>(true);
+            _velocityLookup = GetComponentLookup<TrackedVelocity>(true);
         }
 
         protected override void OnUpdate()
         {
+            CompleteDependency();
             float dt = SystemAPI.Time.DeltaTime;
+
+            // Refresh lookups once per frame.
+            _transformLookup.Update(this);
+            _healthLookup.Update(this);
+            _isDeadLookup.Update(this);
+            _velocityLookup.Update(this);
 
             // Get pool system ref for acquiring projectiles.
             var poolSystemHandle = World.Unmanaged.GetExistingUnmanagedSystem<ProjectilePoolSystem>();
@@ -42,9 +60,10 @@ namespace Combat.Systems
             // Frame-unique base seed from time — each entity will mix in its own index.
             uint frameSeed = (uint)(SystemAPI.Time.ElapsedTime * 100000.0 + 1.0);
 
-            foreach (var (weapon, weaponState, attackTarget, teamTag, transform, entity) in
+            // PredictionAccuracy added to query — no random lookup on self.
+            foreach (var (weapon, weaponState, attackTarget, teamTag, transform, prediction, entity) in
                      SystemAPI.Query<RefRO<WeaponConfig>, RefRW<WeaponState>, RefRO<AttackTarget>,
-                             RefRO<TeamTag>, RefRO<LocalTransform>>()
+                             RefRO<TeamTag>, RefRO<LocalTransform>, RefRO<PredictionAccuracy>>()
                          .WithAll<IsEngagedTag>()
                          .WithDisabled<IsDeadTag>()
                          .WithEntityAccess())
@@ -53,16 +72,16 @@ namespace Combat.Systems
                 var config = weapon.ValueRO;
                 Entity target = attackTarget.ValueRO.Target;
 
-                // ─── Validate target ───
+                // ─── Validate target (cached lookups — one access each) ───
                 if (!IsTargetValid(target))
                 {
                     Disengage(entity, ref state, config);
                     continue;
                 }
 
-                // ─── Range check ───
+                // ─── Target position (cached lookup — one access) ───
                 float3 myPos = transform.ValueRO.Position;
-                float3 targetPos = SystemAPI.GetComponent<LocalTransform>(target).Position;
+                float3 targetPos = _transformLookup[target].Position;
                 float distSq = math.distancesq(myPos, targetPos);
                 bool inRange = distSq <= config.EffectiveRange * config.EffectiveRange;
 
@@ -109,8 +128,10 @@ namespace Combat.Systems
                         seed ^= (uint)state.BurstRemaining * 2654435761u;
 
                         // Lead prediction: aim at where target will be.
+                        // Target velocity via cached lookup (single TryGet).
+                        // PredictionAccuracy already in query — zero extra lookups.
                         float3 aimPos = ComputeAimPosition(
-                            config, myPos, targetPos, target, entity);
+                            config, myPos, targetPos, target, prediction.ValueRO.Value);
 
                         FireShot(ref pool, ref systemState, poolConfig,
                             config, ref state, entity, teamTag.ValueRO,
@@ -174,12 +195,22 @@ namespace Combat.Systems
 
         // ───────────── Helpers ─────────────
 
+        /// <summary>
+        /// Validates target entity via cached ComponentLookups.
+        /// 2 cached reads vs 3 SystemAPI random lookups in original.
+        /// </summary>
         private bool IsTargetValid(Entity target)
         {
-            return target != Entity.Null &&
-                   SystemAPI.Exists(target) &&
-                   SystemAPI.HasComponent<Health>(target) &&
-                   !SystemAPI.IsComponentEnabled<IsDeadTag>(target);
+            if (target == Entity.Null)
+                return false;
+
+            if (!_healthLookup.HasComponent(target))
+                return false;
+
+            if (!_isDeadLookup.HasComponent(target))
+                return false;
+
+            return !_isDeadLookup.IsComponentEnabled(target);
         }
 
         private void Disengage(Entity entity, ref WeaponState state, WeaponConfig config)
@@ -191,16 +222,20 @@ namespace Combat.Systems
             state.CurrentDispersion = config.BaseDispersion;
         }
 
+        /// <summary>
+        /// Computes lead prediction aim position.
+        /// Target velocity via cached TryGetComponent (1 lookup instead of Has + Get = 2).
+        /// PredictionAccuracy passed as value from query — zero extra lookups.
+        /// </summary>
         private float3 ComputeAimPosition(
             WeaponConfig config, float3 myPos, float3 targetPos,
-            Entity target, Entity self)
+            Entity target, float accuracy)
         {
-            if (!SystemAPI.HasComponent<TrackedVelocity>(target) ||
-                !SystemAPI.HasComponent<PredictionAccuracy>(self))
+            // Single TryGet replaces HasComponent + GetComponent (2 → 1 lookup).
+            if (!_velocityLookup.TryGetComponent(target, out var trackedVelocity))
                 return targetPos;
 
-            float3 targetVel = SystemAPI.GetComponent<TrackedVelocity>(target).Value;
-            float accuracy = SystemAPI.GetComponent<PredictionAccuracy>(self).Value;
+            float3 targetVel = trackedVelocity.Value;
             float3 spawnPos = myPos + config.MuzzleOffset;
             float speed = math.max(config.ProjectileSpeed, 0.1f);
 
